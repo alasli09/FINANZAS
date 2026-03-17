@@ -3,9 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EcoFinanzas Ultra - Sync Fix</title>
+    <title>EcoFinanzas Ultra - Motor Reforzado</title>
     
-    <!-- Librerías Externas -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://unpkg.com/lucide@latest"></script>
@@ -14,7 +13,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, deleteDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, deleteDoc, updateDoc, writeBatch } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         const firebaseConfig = JSON.parse(__firebase_config);
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'finanzas-maestro-excel';
@@ -27,22 +26,23 @@
         let chartInstance = null;
         const METAS = { A: 2640750, B: 3202451 };
 
-        const initAuth = async () => {
-            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                await signInWithCustomToken(auth, __initial_auth_token);
-            } else {
-                await signInAnonymously(auth);
-            }
-        };
-        initAuth();
-
         onAuthStateChanged(auth, (u) => {
             user = u;
             if (user) {
                 document.getElementById('user-id-display').innerText = user.uid;
                 escucharDatos();
+            } else {
+                iniciarSesion();
             }
         });
+
+        async function iniciarSesion() {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        }
 
         function escucharDatos() {
             if (!user) return;
@@ -55,14 +55,13 @@
             }, (err) => console.error("Error nube:", err));
         }
 
-        // MOTOR DE IMPORTACIÓN MEJORADO
+        // --- MOTOR DE IMPORTACIÓN REFORZADO ---
         window.handleExcelFile = async (event) => {
             const file = event.target.files[0];
-            if (!file) return;
+            if (!file || !user) return;
 
-            // Mostrar estado de carga
-            const btnLabel = document.getElementById('import-status-text');
-            btnLabel.innerText = "Procesando archivo... espera";
+            const status = document.getElementById('import-status-text');
+            status.innerText = "Leyendo archivo...";
             
             const reader = new FileReader();
             reader.onload = async (e) => {
@@ -73,76 +72,94 @@
                     const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
                     
                     let cuentaActual = "General";
-                    let importados = 0;
+                    let datosAImportar = [];
 
-                    for (let row of rows) {
-                        if (!row || row.length < 2) continue;
+                    for (let i = 0; i < rows.length; i++) {
+                        const row = rows[i];
+                        if (!row || row.length === 0) continue;
                         
-                        // 1. Identificar Cuenta por encabezados de texto
+                        status.innerText = `Analizando fila ${i} de ${rows.length}...`;
+
                         const rowStr = row.join(" ").toLowerCase();
+                        
+                        // Detectar cambios de cuenta/tarjeta
                         if(rowStr.includes('bdb')) { cuentaActual = "BdB"; continue; }
                         if(rowStr.includes('nubank')) { cuentaActual = "Nubank"; continue; }
                         if(rowStr.includes('bbva')) { cuentaActual = "BBVA"; continue; }
                         if(rowStr.includes('gastos fijos')) { cuentaActual = "Gastos Fijos"; continue; }
                         if(rowStr.includes('ingreso fijo')) { cuentaActual = "Sueldos"; continue; }
 
-                        // 2. Buscar Monto y Fecha en cualquier columna de la fila
                         let monto = null;
                         let fecha = null;
                         let deudor = "N/A";
-                        let desc = "Sin descripción";
+                        let desc = "";
 
-                        row.forEach((cell, idx) => {
-                            if (cell === null || cell === undefined) return;
+                        // Escaneo profundo de celdas
+                        row.forEach((cell) => {
+                            if (cell === null || cell === undefined || cell === "") return;
                             
-                            // Buscar Monto
-                            if (typeof cell === 'number' && !monto && cell > 100) { 
-                                monto = cell; 
+                            // Detectar Monto (Números o strings con $)
+                            if (typeof cell === 'number' && !monto && cell !== 0) {
+                                // Evitar confundir años con montos si el valor es pequeño
+                                if (cell > 2030 || cell < 2024) monto = cell;
                             } else if (typeof cell === 'string' && cell.includes('$')) {
-                                const val = parseFloat(cell.replace(/[$. ]/g, '').replace(',', '.'));
+                                const limpio = cell.replace(/[$. ]/g, '').replace(',', '.');
+                                const val = parseFloat(limpio);
                                 if (!isNaN(val)) monto = val;
                             }
 
-                            // Buscar Fecha
-                            if (!fecha && (typeof cell === 'number' && cell > 40000)) { // Formato fecha Excel
-                                fecha = procesarFechaExcel(cell);
-                            } else if (!fecha && typeof cell === 'string' && cell.includes('/')) {
-                                fecha = procesarFechaExcel(cell);
+                            // Detectar Fecha
+                            if (!fecha) {
+                                if (typeof cell === 'number' && cell > 40000 && cell < 60000) {
+                                    fecha = procesarFechaExcel(cell);
+                                } else if (typeof cell === 'string' && cell.includes('/')) {
+                                    fecha = procesarFechaExcel(cell);
+                                }
                             }
 
-                            // Buscar deudor (nombres comunes de tu excel)
+                            // Detectar Deudor
                             const cStr = String(cell).toLowerCase();
                             if (["alan", "jhannina", "hill", "flavio"].includes(cStr)) deudor = cell;
                         });
 
-                        // 3. Si encontramos al menos un monto, guardamos
                         if (monto) {
-                            // Si no hay fecha, usamos la del mes actual
-                            if (!fecha) fecha = '2026-03-01';
+                            // Si no hay descripción clara, usamos las celdas de texto
+                            desc = row.find(c => typeof c === 'string' && !c.includes('$') && !c.includes('/') && c.length > 3) || "Movimiento Excel";
                             
-                            // La descripción suele ser la última columna con texto
-                            desc = row[row.length - 1] || "Gasto importado";
-
-                            const nuevoDoc = {
-                                fecha,
-                                descripcion: String(desc).substring(0, 30),
+                            datosAImportar.push({
+                                fecha: fecha || '2026-03-01',
+                                descripcion: String(desc).substring(0, 40),
                                 monto: Math.abs(monto),
                                 deudor,
                                 cuenta: cuentaActual,
                                 tipo: cuentaActual === "Sueldos" ? "ingreso" : "gasto",
                                 timestamp: Date.now() + Math.random()
-                            };
-                            await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'movimientos'), nuevoDoc);
-                            importados++;
+                            });
                         }
                     }
-                    alert(`¡Éxito! Se importaron ${importados} registros.`);
+
+                    if (datosAImportar.length === 0) {
+                        alert("No encontré datos válidos. Revisa que el Excel tenga montos visibles.");
+                        return;
+                    }
+
+                    // Guardado por lotes (batch) para no colgar la App
+                    status.innerText = `Sincronizando ${datosAImportar.length} registros...`;
+                    const colRef = collection(db, 'artifacts', appId, 'users', user.uid, 'movimientos');
+                    
+                    // Procesamos en grupos de 20 para ser rápidos pero estables
+                    for (let i = 0; i < datosAImportar.length; i++) {
+                        await addDoc(colRef, datosAImportar[i]);
+                        if (i % 10 === 0) status.innerText = `Sincronizando... ${i}/${datosAImportar.length}`;
+                    }
+
+                    alert(`¡Éxito! Se importaron ${datosAImportar.length} registros.`);
+                    document.getElementById('modal-import').classList.add('hidden');
                 } catch (err) {
                     console.error(err);
-                    alert("Error al leer el archivo. Asegúrate de que sea un .xlsx válido.");
+                    alert("Error crítico al procesar. Intenta con un archivo más pequeño.");
                 } finally {
-                    btnLabel.innerText = "Click para buscar archivo";
-                    document.getElementById('modal-import').classList.add('hidden');
+                    status.innerText = "Click para buscar archivo";
                 }
             };
             reader.readAsArrayBuffer(file);
@@ -154,14 +171,12 @@
                     const date = new Date(Math.round((fecha - 25569) * 86400 * 1000));
                     return date.toISOString().split('T')[0];
                 }
-                if (typeof fecha === 'string' && fecha.includes('/')) {
-                    const parts = fecha.split('/');
-                    if (parts.length === 3) {
-                        const anio = parts[2].length === 2 ? "20" + parts[2] : parts[2];
-                        return `${anio}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
-                    }
+                const parts = fecha.split('/');
+                if (parts.length === 3) {
+                    const anio = parts[2].length === 2 ? "20" + parts[2] : parts[2];
+                    return `${anio}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
                 }
-            } catch (e) { return '2026-03-01'; }
+            } catch (e) {}
             return '2026-03-01';
         }
 
@@ -181,7 +196,7 @@
         };
 
         window.borrarRegistro = async (id) => {
-            if(confirm("¿Eliminar?")) await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'movimientos', id));
+            if(confirm("¿Borrar?")) await deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'movimientos', id));
         };
 
         function renderizar() {
@@ -205,26 +220,29 @@
 
             document.getElementById('res-ingresos').innerText = `$${ing.toLocaleString()}`;
             document.getElementById('res-gastos').innerText = `$${gas.toLocaleString()}`;
-            document.getElementById('res-balance').innerText = `$${(ing - gas).toLocaleString()}`;
-            document.getElementById('res-balance-sticky').innerText = `$${(ing - gas).toLocaleString()}`;
+            const bal = ing - gas;
+            document.getElementById('res-balance').innerText = `$${bal.toLocaleString()}`;
+            document.getElementById('res-balance-sticky').innerText = `$${bal.toLocaleString()}`;
 
             const pctA = Math.min((gas / METAS.A) * 100, 100);
             document.getElementById('bar-meta-a').style.width = pctA + '%';
             document.getElementById('val-meta-a').innerText = `$${gas.toLocaleString()} / $${METAS.A.toLocaleString()}`;
 
             const lista = document.getElementById('lista-movimientos');
-            lista.innerHTML = filtradas.map(t => `
-                <div class="bg-white p-4 rounded-2xl shadow-sm flex justify-between items-center mb-3 border-l-4 ${t.tipo === 'ingreso' ? 'border-green-400' : 'border-indigo-400'}">
-                    <div class="flex-1 overflow-hidden mr-2">
-                        <p class="font-bold text-sm text-gray-800 truncate">${t.descripcion}</p>
-                        <p class="text-[9px] text-gray-400 uppercase font-black">${t.cuenta} • ${t.deudor} • ${t.fecha}</p>
+            lista.innerHTML = filtradas.length === 0 
+                ? '<p class="text-center text-gray-400 py-10 text-xs">No hay datos en este mes.</p>'
+                : filtradas.map(t => `
+                    <div class="bg-white p-4 rounded-2xl shadow-sm flex justify-between items-center mb-3 border-l-4 ${t.tipo === 'ingreso' ? 'border-green-400' : 'border-indigo-400'} animate-up">
+                        <div class="flex-1 overflow-hidden mr-2">
+                            <p class="font-bold text-sm text-gray-800 truncate">${t.descripcion}</p>
+                            <p class="text-[9px] text-gray-400 uppercase font-black">${t.cuenta} • ${t.deudor} • ${t.fecha}</p>
+                        </div>
+                        <div class="text-right flex items-center space-x-2">
+                            <p class="font-black text-sm whitespace-nowrap ${t.tipo === 'ingreso' ? 'text-green-600' : 'text-gray-800'}">$${t.monto.toLocaleString()}</p>
+                            <button onclick="borrarRegistro('${t.id}')" class="text-gray-200 hover:text-red-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
+                        </div>
                     </div>
-                    <div class="text-right flex items-center space-x-2">
-                        <p class="font-black text-sm whitespace-nowrap ${t.tipo === 'ingreso' ? 'text-green-600' : 'text-gray-800'}">$${t.monto.toLocaleString()}</p>
-                        <button onclick="borrarRegistro('${t.id}')" class="text-gray-200 hover:text-red-500"><i data-lucide="trash-2" class="w-4 h-4"></i></button>
-                    </div>
-                </div>
-            `).join('') || '<p class="text-center text-gray-400 py-10">Sin datos</p>';
+                `).join('');
 
             actualizarGrafico(porCuenta);
             lucide.createIcons();
@@ -239,177 +257,182 @@
                 type: 'doughnut',
                 data: {
                     labels: labels,
-                    datasets: [{ data: Object.values(datos), backgroundColor: ['#6366f1', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'], borderWidth: 0 }]
+                    datasets: [{ data: Object.values(datos), backgroundColor: ['#4338ca', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6'], borderWidth: 0 }]
                 },
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, cutout: '75%' }
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, cutout: '78%' }
             });
         }
 
         window.renderizar = renderizar;
-
         window.addEventListener('scroll', () => {
-            const stickyHeader = document.getElementById('sticky-min-header');
-            if (window.scrollY > 250) stickyHeader.style.transform = "translateY(0)";
-            else stickyHeader.style.transform = "translateY(-100%)";
+            const sticky = document.getElementById('sticky-min-header');
+            if (window.scrollY > 250) sticky.style.transform = "translateY(0)";
+            else sticky.style.transform = "translateY(-100%)";
         });
     </script>
 
     <style>
         body { -webkit-tap-highlight-color: transparent; background: #f8fafc; overflow-x: hidden; }
-        .card-gradient { background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%); }
-        .animate-up { animation: fadeInUp 0.4s ease-out; }
-        @keyframes fadeInUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        .card-gradient { background: linear-gradient(135deg, #3730a3 0%, #5b21b6 100%); }
+        .animate-up { animation: fadeInUp 0.3s ease-out; }
+        @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     </style>
 </head>
 <body class="font-sans pb-32">
 
-    <!-- Mini Header (Solo aparece al bajar) -->
-    <div id="sticky-min-header" class="fixed top-0 inset-x-0 z-[60] bg-indigo-700 text-white p-4 shadow-xl transition-transform duration-300 -translate-y-full flex justify-between items-center">
-        <h2 class="font-black text-xs uppercase tracking-widest">Balance</h2>
+    <!-- Header Pegajoso -->
+    <div id="sticky-min-header" class="fixed top-0 inset-x-0 z-[60] bg-indigo-800 text-white p-4 shadow-2xl transition-transform duration-300 -translate-y-full flex justify-between items-center">
+        <h2 class="font-black text-[10px] uppercase tracking-widest">Balance Actual</h2>
         <span id="res-balance-sticky" class="font-black text-lg">$0</span>
     </div>
 
-    <!-- Header Colapsable -->
-    <header class="card-gradient text-white p-6 pb-12 rounded-b-[3.5rem] shadow-2xl relative z-40">
+    <!-- Header Principal -->
+    <header class="card-gradient text-white p-6 pb-14 rounded-b-[4rem] shadow-2xl relative z-40">
         <div class="flex justify-between items-center mb-8">
-            <div>
-                <h1 class="text-xl font-black tracking-tighter italic">ECOFINANZAS</h1>
-                <div class="flex items-center text-[8px] bg-black/20 px-2 py-1 rounded-full mt-1 w-fit">
-                    <span class="w-1.5 h-1.5 bg-green-400 rounded-full mr-2 animate-pulse"></span>
-                    SYNC OK: <span id="user-id-display" class="ml-1 opacity-60 font-mono text-[7px]">...</span>
+            <div class="flex items-center space-x-2">
+                <div class="w-10 h-10 bg-white/10 rounded-xl flex items-center justify-center backdrop-blur-md">
+                    <i data-lucide="wallet" class="w-6 h-6"></i>
+                </div>
+                <div>
+                    <h1 class="text-lg font-black tracking-tighter italic leading-none">ECOFINANZAS</h1>
+                    <span id="user-id-display" class="text-[7px] opacity-40 font-mono">conectando...</span>
                 </div>
             </div>
             <div class="flex space-x-2">
-                <button onclick="document.getElementById('modal-import').classList.remove('hidden')" class="p-3 bg-white/10 rounded-2xl hover:bg-white/20">
-                    <i data-lucide="file-spreadsheet" class="w-5 h-5 text-green-300"></i>
+                <button onclick="document.getElementById('modal-import').classList.remove('hidden')" class="p-3 bg-white/10 rounded-2xl border border-white/10 shadow-lg">
+                    <i data-lucide="upload" class="w-5 h-5 text-green-300"></i>
                 </button>
-                <button onclick="document.getElementById('modal-info').classList.remove('hidden')" class="p-3 bg-white/10 rounded-2xl hover:bg-white/20">
-                    <i data-lucide="link" class="w-5 h-5 text-indigo-200"></i>
+                <button onclick="document.getElementById('modal-info').classList.remove('hidden')" class="p-3 bg-white/10 rounded-2xl border border-white/10 shadow-lg">
+                    <i data-lucide="user" class="w-5 h-5 text-indigo-200"></i>
                 </button>
             </div>
         </div>
 
-        <div class="bg-white/10 p-6 rounded-[2.5rem] border border-white/10 backdrop-blur-md">
-            <p class="text-[10px] uppercase font-bold opacity-60 tracking-widest">Disponible</p>
-            <h2 id="res-balance" class="text-4xl font-black mt-1">$0</h2>
+        <div class="bg-white/10 p-7 rounded-[2.5rem] border border-white/20 backdrop-blur-xl shadow-inner">
+            <p class="text-[10px] uppercase font-bold opacity-50 tracking-widest mb-1 text-center">Disponible Neto</p>
+            <h2 id="res-balance" class="text-5xl font-black mt-1 text-center tracking-tighter">$0</h2>
             
-            <div class="grid grid-cols-2 gap-4 mt-6 pt-6 border-t border-white/10">
-                <div>
-                    <p class="text-[9px] font-bold opacity-40 uppercase tracking-tighter">Entradas</p>
-                    <p id="res-ingresos" class="text-green-300 font-black text-base">$0</p>
+            <div class="grid grid-cols-2 gap-4 mt-8 pt-6 border-t border-white/10">
+                <div class="text-center">
+                    <p class="text-[9px] font-black opacity-40 uppercase tracking-tighter mb-1">Entradas</p>
+                    <p id="res-ingresos" class="text-green-400 font-black text-lg leading-none">$0</p>
                 </div>
-                <div class="text-right">
-                    <p class="text-[9px] font-bold opacity-40 uppercase tracking-tighter">Salidas</p>
-                    <p id="res-gastos" class="text-red-300 font-black text-base">$0</p>
+                <div class="text-center border-l border-white/5">
+                    <p class="text-[9px] font-black opacity-40 uppercase tracking-tighter mb-1">Salidas</p>
+                    <p id="res-gastos" class="text-red-400 font-black text-lg leading-none">$0</p>
                 </div>
             </div>
         </div>
 
-        <!-- Meta A -->
-        <div class="mt-6 px-2">
-            <div class="flex justify-between text-[9px] font-black uppercase mb-1.5">
-                <span class="opacity-60">Meta Gasto A</span>
-                <span id="val-meta-a" class="text-indigo-200 opacity-80">$0 / $0</span>
+        <!-- Meta Visual -->
+        <div class="mt-8 px-4">
+            <div class="flex justify-between text-[9px] font-black uppercase mb-2">
+                <span class="opacity-50 tracking-widest">Meta Gasto A</span>
+                <span id="val-meta-a" class="text-indigo-200">$0 / $0</span>
             </div>
-            <div class="h-2 bg-black/30 rounded-full overflow-hidden">
-                <div id="bar-meta-a" class="h-full bg-indigo-400 transition-all duration-1000"></div>
+            <div class="h-2.5 bg-black/40 rounded-full p-0.5 overflow-hidden shadow-inner">
+                <div id="bar-meta-a" class="h-full bg-indigo-400 rounded-full transition-all duration-1000 shadow-[0_0_12px_rgba(129,140,248,0.6)]"></div>
             </div>
         </div>
     </header>
 
-    <!-- Filtros -->
-    <div class="flex justify-center -mt-6 relative z-50 px-6 space-x-2">
-        <select id="filtro-mes" onchange="renderizar()" class="bg-white shadow-xl rounded-2xl px-4 py-4 text-xs font-black border-none outline-none flex-1 text-center text-indigo-900">
+    <!-- Selectores de Fecha -->
+    <div class="flex justify-center -mt-8 relative z-50 px-8 space-x-3">
+        <select id="filtro-mes" onchange="renderizar()" class="bg-white shadow-2xl rounded-2xl px-5 py-5 text-xs font-black border-none outline-none flex-1 text-center text-indigo-900 appearance-none">
             <option value="0">ENERO</option><option value="1">FEBRERO</option><option value="2" selected>MARZO</option>
             <option value="3">ABRIL</option><option value="4">MAYO</option><option value="5">JUNIO</option>
             <option value="6">JULIO</option><option value="7">AGOSTO</option><option value="8">SEPTIEMBRE</option>
             <option value="9">OCTUBRE</option><option value="10">NOVIEMBRE</option><option value="11">DICIEMBRE</option>
         </select>
-        <select id="filtro-anio" onchange="renderizar()" class="bg-white shadow-xl rounded-2xl px-4 py-4 text-xs font-black border-none outline-none flex-1 text-center text-indigo-900">
+        <select id="filtro-anio" onchange="renderizar()" class="bg-white shadow-2xl rounded-2xl px-5 py-5 text-xs font-black border-none outline-none flex-1 text-center text-indigo-900 appearance-none">
             <option value="2025">2025</option><option value="2026" selected>2026</option>
         </select>
     </div>
 
-    <main class="p-6 space-y-8 mt-4">
-        <!-- Dashboard -->
-        <div class="bg-white p-6 rounded-[2.5rem] shadow-sm border border-gray-100 flex items-center space-x-6 animate-up">
-            <div class="relative w-28 h-28">
+    <main class="p-6 space-y-8 mt-6">
+        <!-- Gráfico Central -->
+        <div class="bg-white p-8 rounded-[3rem] shadow-sm border border-gray-100 flex flex-col items-center">
+            <div class="relative w-40 h-40 mb-6">
                 <canvas id="chart"></canvas>
+                <div class="absolute inset-0 flex items-center justify-center flex-col">
+                    <span class="text-[8px] font-black text-gray-300 uppercase tracking-widest">Gastos</span>
+                    <i data-lucide="pie-chart" class="w-4 h-4 text-gray-200"></i>
+                </div>
             </div>
-            <div class="flex-1">
-                <h3 class="text-[10px] font-black text-gray-400 uppercase tracking-widest">Resumen Gastos</h3>
-                <p class="text-xs text-gray-500 font-bold mt-1 leading-tight">Distribución visual de tus tarjetas y fijos.</p>
+            <div class="text-center">
+                <h3 class="text-[11px] font-black text-gray-400 uppercase tracking-widest">Distribución del Mes</h3>
+                <p class="text-[10px] text-gray-400 font-medium max-w-[150px] mx-auto mt-1 italic">Vigila tus consumos por cada tarjeta.</p>
             </div>
         </div>
 
-        <!-- Historial -->
-        <div class="space-y-4 animate-up" style="animation-delay: 0.2s">
-            <h3 class="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-2">Movimientos Recientes</h3>
-            <div id="lista-movimientos" class="space-y-3 pb-10">
-                <!-- Dinámico -->
+        <!-- Lista de Movimientos -->
+        <div class="space-y-4">
+            <h3 class="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-3">Actividad Reciente</h3>
+            <div id="lista-movimientos" class="space-y-3 min-h-[100px]">
+                <!-- Se llena dinámicamente -->
             </div>
         </div>
     </main>
 
-    <!-- FAB -->
-    <button onclick="abrirModal()" class="fixed bottom-8 right-6 bg-indigo-600 text-white p-5 rounded-[2rem] shadow-2xl z-50 active:scale-90 transition-all">
+    <!-- Botón Flotante -->
+    <button onclick="abrirModal()" class="fixed bottom-10 right-8 bg-indigo-700 text-white p-6 rounded-[2.5rem] shadow-2xl z-50 hover:scale-110 active:scale-90 transition-all border-4 border-white">
         <i data-lucide="plus" class="w-8 h-8"></i>
     </button>
 
-    <!-- MODAL REGISTRO -->
-    <div id="modal-registro" class="hidden fixed inset-0 bg-black/70 backdrop-blur-md z-[100] flex items-end sm:items-center justify-center p-4">
-        <div class="bg-white w-full max-w-md rounded-t-[3rem] sm:rounded-[3rem] p-8 shadow-2xl animate-up overflow-y-auto max-h-[90vh]">
+    <!-- MODAL IMPORT (EL MÁS IMPORTANTE) -->
+    <div id="modal-import" class="hidden fixed inset-0 bg-black/80 backdrop-blur-lg z-[100] flex items-center justify-center p-6">
+        <div class="bg-white w-full max-w-md rounded-[3rem] p-10 shadow-2xl text-center animate-up">
+            <div class="w-20 h-20 bg-green-50 text-green-500 rounded-full flex items-center justify-center mx-auto mb-6 shadow-inner">
+                <i data-lucide="database" class="w-10 h-10"></i>
+            </div>
+            <h2 class="text-2xl font-black mb-2 tracking-tight">Carga de Datos</h2>
+            <p class="text-xs text-gray-400 mb-8 font-bold uppercase tracking-widest">Importación Masiva desde Excel</p>
+            
+            <label class="group block w-full cursor-pointer bg-gray-50 border-4 border-dashed border-gray-100 p-10 rounded-[2.5rem] hover:border-green-300 hover:bg-green-50 transition-all">
+                <input type="file" id="excel-input" accept=".xlsx, .xls, .csv" class="hidden" onchange="handleExcelFile(event)">
+                <i data-lucide="file-text" class="w-12 h-12 text-gray-300 group-hover:text-green-400 mx-auto mb-4 transition-colors"></i>
+                <span id="import-status-text" class="text-sm font-black text-gray-500 group-hover:text-green-600">Haz clic para elegir el archivo</span>
+            </label>
+            
+            <button onclick="document.getElementById('modal-import').classList.add('hidden')" class="mt-8 text-gray-400 text-[10px] font-black uppercase tracking-widest hover:text-red-400 transition-colors">Cerrar Ventana</button>
+        </div>
+    </div>
+
+    <!-- MODAL REGISTRO MANUAL -->
+    <div id="modal-registro" class="hidden fixed inset-0 bg-black/80 backdrop-blur-lg z-[100] flex items-end sm:items-center justify-center p-4">
+        <div class="bg-white w-full max-w-md rounded-t-[3.5rem] sm:rounded-[3.5rem] p-10 shadow-2xl animate-up overflow-y-auto max-h-[90vh]">
             <div class="flex justify-between items-center mb-8">
-                <h2 class="text-2xl font-black">Nuevo Movimiento</h2>
+                <h2 class="text-2xl font-black tracking-tight">Nuevo Gasto</h2>
                 <button onclick="cerrarModal()" class="text-gray-300"><i data-lucide="x"></i></button>
             </div>
-            <form onsubmit="guardarRegistro(event)" class="space-y-4">
-                <div class="grid grid-cols-2 gap-2">
-                    <select id="tipo" class="bg-gray-100 border-none rounded-2xl p-4 font-bold text-sm">
-                        <option value="gasto">Gasto (-)</option>
-                        <option value="ingreso">Ingreso (+)</option>
+            <form onsubmit="guardarRegistro(event)" class="space-y-5">
+                <div class="grid grid-cols-2 gap-3">
+                    <select id="tipo" class="bg-gray-50 border-none rounded-2xl p-5 font-black text-xs text-indigo-900">
+                        <option value="gasto">SALIDA (-)</option>
+                        <option value="ingreso">ENTRADA (+)</option>
                     </select>
-                    <select id="cuenta" class="bg-gray-100 border-none rounded-2xl p-4 font-bold text-sm text-indigo-600">
+                    <select id="cuenta" class="bg-gray-50 border-none rounded-2xl p-5 font-black text-xs text-indigo-600">
                         <option value="BdB">BdB</option><option value="Nubank">Nubank</option><option value="BBVA">BBVA</option>
-                        <option value="Gastos Fijos">Gastos Fijos</option><option value="Efectivo">Efectivo</option>
-                        <option value="Sueldos">Sueldos</option>
+                        <option value="Gastos Fijos">FIJOS</option><option value="Efectivo">EFECTIVO</option>
+                        <option value="Sueldos">SUELDO</option>
                     </select>
                 </div>
-                <input type="number" id="monto" placeholder="0.00" step="0.01" required class="w-full bg-gray-50 border-none rounded-3xl p-6 text-4xl font-black text-center focus:ring-2 focus:ring-indigo-500">
-                <input type="text" id="descripcion" placeholder="Descripción" required class="w-full bg-gray-100 border-none rounded-2xl p-4 font-bold">
-                <input type="text" id="deudor" placeholder="¿Quién lo debe?" class="w-full bg-gray-100 border-none rounded-2xl p-4 font-bold">
-                <input type="date" id="fecha" required class="w-full bg-gray-100 border-none rounded-2xl p-4 font-bold text-indigo-600">
-                <button type="submit" class="w-full bg-indigo-600 text-white p-5 rounded-2xl font-black text-lg shadow-xl mt-4">Guardar en Nube</button>
+                <input type="number" id="monto" placeholder="0.00" step="0.01" required class="w-full bg-gray-50 border-none rounded-3xl p-7 text-5xl font-black text-center focus:ring-4 focus:ring-indigo-100 text-indigo-900">
+                <input type="text" id="descripcion" placeholder="¿En qué lo gastaste?" required class="w-full bg-gray-50 border-none rounded-2xl p-5 font-bold">
+                <input type="text" id="deudor" placeholder="Deudor (Alan, Jhannina...)" class="w-full bg-gray-50 border-none rounded-2xl p-5 font-bold">
+                <input type="date" id="fecha" required class="w-full bg-gray-50 border-none rounded-2xl p-5 font-black text-indigo-600 uppercase">
+                <button type="submit" class="w-full bg-indigo-700 text-white p-6 rounded-3xl font-black text-lg shadow-xl mt-4 hover:bg-indigo-800">Sincronizar ahora</button>
             </form>
         </div>
     </div>
 
-    <!-- MODAL IMPORT -->
-    <div id="modal-import" class="hidden fixed inset-0 bg-black/70 backdrop-blur-md z-[100] flex items-center justify-center p-6">
-        <div class="bg-white w-full max-w-md rounded-[2.5rem] p-8 shadow-2xl text-center">
-            <div class="w-16 h-16 bg-green-100 text-green-600 rounded-full flex items-center justify-center mx-auto mb-4">
-                <i data-lucide="upload-cloud" class="w-8 h-8"></i>
-            </div>
-            <h2 class="text-xl font-black mb-1">Importar Libro Excel</h2>
-            <p class="text-[10px] text-gray-400 mb-6 font-bold uppercase tracking-widest">Sube tu archivo .xlsx directamente</p>
-            
-            <label class="block w-full cursor-pointer bg-green-50 border-2 border-dashed border-green-200 p-8 rounded-3xl hover:bg-green-100 transition-colors">
-                <input type="file" id="excel-input" accept=".xlsx, .xls, .csv" class="hidden" onchange="handleExcelFile(event)">
-                <i data-lucide="file-plus" class="w-10 h-10 text-green-400 mx-auto mb-2"></i>
-                <span id="import-status-text" class="text-sm font-bold text-green-700">Click para buscar archivo</span>
-            </label>
-            
-            <button onclick="document.getElementById('modal-import').classList.add('hidden')" class="mt-6 text-gray-400 text-xs font-black uppercase tracking-widest">Cerrar</button>
-        </div>
-    </div>
-
     <!-- MODAL ENLACE -->
-    <div id="modal-info" class="hidden fixed inset-0 bg-black/70 backdrop-blur-md z-[100] flex items-center justify-center p-6">
-        <div class="bg-white w-full max-w-sm rounded-[2.5rem] p-8 shadow-2xl text-center">
-            <h2 class="text-xl font-black mb-2">Vincular Dispositivo</h2>
-            <p class="text-[10px] text-gray-400 mb-6 font-bold uppercase tracking-widest">Tu código de sincronización:</p>
-            <div class="bg-gray-50 p-4 rounded-2xl font-mono text-[10px] break-all mb-4 text-indigo-600 border border-indigo-50 select-all" id="id-copy">...</div>
-            <button onclick="document.getElementById('modal-info').classList.add('hidden')" class="w-full bg-gray-900 text-white py-4 rounded-2xl font-bold text-xs uppercase tracking-widest">Entendido</button>
+    <div id="modal-info" class="hidden fixed inset-0 bg-black/80 backdrop-blur-lg z-[100] flex items-center justify-center p-6">
+        <div class="bg-white w-full max-w-sm rounded-[3rem] p-10 shadow-2xl text-center animate-up">
+            <h2 class="text-xl font-black mb-4 tracking-tight">Vincular Dispositivo</h2>
+            <div class="bg-indigo-50 p-6 rounded-[2rem] font-mono text-[9px] break-all mb-6 text-indigo-700 border border-indigo-100 select-all shadow-inner" id="id-copy">...</div>
+            <p class="text-[9px] text-gray-400 mb-8 font-black uppercase tracking-widest leading-relaxed">Este es tu ID de usuario. Úsalo en otros dispositivos para ver la misma información.</p>
+            <button onclick="document.getElementById('modal-info').classList.add('hidden')" class="w-full bg-gray-900 text-white py-5 rounded-2xl font-black text-[10px] uppercase tracking-widest">Cerrar</button>
         </div>
     </div>
 
@@ -418,7 +441,7 @@
         function cerrarModal() { document.getElementById('modal-registro').classList.add('hidden'); }
         const checkID = setInterval(() => {
             const uid = document.getElementById('user-id-display').innerText;
-            if(uid !== '...') { document.getElementById('id-copy').innerText = uid; clearInterval(checkID); }
+            if(uid !== 'conectando...') { document.getElementById('id-copy').innerText = uid; clearInterval(checkID); }
         }, 1000);
         lucide.createIcons();
     </script>
